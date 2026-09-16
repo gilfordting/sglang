@@ -225,6 +225,7 @@ def build_kv_only_group(
     override_kv_cache_dim: Optional[int] = None,
     host_size: Optional[float] = None,
     mtp_draft_device_pools: tuple[Any, ...] = (),
+    is_dummy: bool = False,
 ) -> HostPoolGroup:
     """Anchor-only host pool group for a flat MHA/MLA device pool."""
     transfer_layer_num = len(full_layer_mapping)
@@ -235,6 +236,7 @@ def build_kv_only_group(
         override_kv_cache_dim=override_kv_cache_dim,
         host_size=host_size,
         mtp_draft_device_pools=mtp_draft_device_pools,
+        is_dummy=is_dummy,
     )
     if mtp_draft_device_pools:
         full_layer_mapping = _with_mtp_layer_mapping(

@@ -10,6 +10,7 @@ import torch
 import sglang.srt.managers.cache_controller as cache_controller_module
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
@@ -267,6 +268,103 @@ class TestHiCacheMLADedupDraftPlan(unittest.TestCase):
                 self.assertEqual(plan.mode, expected_mode)
                 expected_packed = () if enabled else (draft_pool,)
                 self.assertEqual(target_runner.mtp_draft_device_pools, expected_packed)
+
+
+class TestHiCacheMLADedupAssembler(unittest.TestCase):
+    """Exercise the real assembler call chain (not mocked away) so a kwarg
+    mismatch between build_kv_only_stack -> build_kv_only_group ->
+    build_kv_host_pool fails here instead of at server start."""
+
+    def _params(self):
+        return SimpleNamespace(
+            page_size=64,
+            mtp_draft_device_pools=(),
+            token_to_kv_pool_allocator=object(),
+            tp_cache_group=object(),
+            attn_cp_cache_group=None,
+            attn_tp_cache_group=None,
+            pp_cache_group=None,
+        )
+
+    def test_kv_only_stack_threads_is_dummy_to_host_pool(self):
+        for is_dummy in (False, True):
+            with (
+                self.subTest(is_dummy=is_dummy),
+                mock.patch.object(
+                    hybrid_pool_assembler, "build_kv_host_pool"
+                ) as build_host,
+                mock.patch.object(hybrid_pool_assembler, "build_pool_entry"),
+                mock.patch.object(hybrid_pool_assembler, "HostPoolGroup"),
+                mock.patch.object(
+                    hybrid_pool_assembler, "HybridCacheController"
+                ) as controller_cls,
+                mock.patch.object(
+                    hybrid_pool_assembler,
+                    "get_memory",
+                    return_value=SimpleNamespace(
+                        hicache_write_policy="write_through",
+                        hicache_io_backend="kernel",
+                        hicache_host_memory_mode="cache",
+                    ),
+                ),
+            ):
+                hybrid_pool_assembler.build_kv_only_stack(
+                    params=self._params(),
+                    kv_pool=object(),
+                    full_layer_mapping={0: 0, 1: 1},
+                    load_cache_event=None,
+                    storage_backend=None,
+                    use_mla=True,
+                    is_dummy=is_dummy,
+                    mla_dedup_context=None,
+                )
+                self.assertEqual(build_host.call_args.kwargs["is_dummy"], is_dummy)
+                self.assertIsNone(controller_cls.call_args.kwargs["mla_dedup_context"])
+
+    def test_kv_host_pool_passes_is_dummy_only_for_mla(self):
+        for use_mla, is_dummy, expect_kwarg in (
+            (True, True, True),
+            (True, False, False),
+            (False, True, False),
+        ):
+            with (
+                self.subTest(use_mla=use_mla, is_dummy=is_dummy),
+                mock.patch.object(
+                    hybrid_pool_assembler, "MLATokenToKVPoolHost"
+                ) as mla_cls,
+                mock.patch.object(
+                    hybrid_pool_assembler,
+                    "get_mha_host_pool_cls",
+                    return_value=mock.Mock(),
+                ) as mha_cls_getter,
+                mock.patch.object(
+                    hybrid_pool_assembler,
+                    "get_parallel",
+                    return_value=SimpleNamespace(dcp_enabled=False),
+                ),
+                mock.patch.object(
+                    hybrid_pool_assembler, "_get_allocator_type", return_value="default"
+                ),
+                mock.patch.object(
+                    hybrid_pool_assembler,
+                    "get_memory",
+                    return_value=SimpleNamespace(
+                        hicache_ratio=2.0,
+                        hicache_size=0,
+                        hicache_mem_layout="layer_first",
+                    ),
+                ),
+            ):
+                hybrid_pool_assembler.build_kv_host_pool(
+                    kv_pool=object(),
+                    page_size=64,
+                    use_mla=use_mla,
+                    is_dummy=is_dummy,
+                )
+                cls = mla_cls if use_mla else mha_cls_getter.return_value
+                self.assertEqual(
+                    cls.call_args.kwargs.get("is_dummy", False), expect_kwarg
+                )
 
 
 if __name__ == "__main__":
