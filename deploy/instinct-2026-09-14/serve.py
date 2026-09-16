@@ -66,12 +66,29 @@ PREFILL_CUDA_GRAPH_MAX_BS = "4096"
 PREFILL_CUDA_GRAPH_BS = "128 256 512 768 1024 1536 2048 3072 4096"
 DECODE_CUDA_GRAPH_MAX_BS = "48"
 
-# HiCache: host-memory (L2) KV cache tier.
-# Host pool size ~= HICACHE_RATIO x GPU KV pool (30.67 GB) x 8 TP ranks.
-# Ratio 3 => ~735 GB of host memory, within the 1 TiB container request
-# (Modal's maximum memory request is 1048576 MiB = 1 TiB).
-HICACHE_RATIO = "3"
-HICACHE_WRITE_POLICY = "write_through_selective"
+# HiCache: host-memory (L2) KV cache tier, MLA host dedup ON.
+# Copied from the Modal Flash K3 prod recipe (autoinference
+# deployments/kimi_k3/prod_serve.py, "dedup-HiCache lane", live on
+# kimi-k3-fprs-plus since 2026-08-13; ran at v10-v12 2026-08-03..06 before that).
+# With --enable-mla-hicache-host-dedup only attn-TP rank 0 allocates the MLA
+# host KV pool; ranks 1-7 hold allocator-only dummies and receive KV by NCCL
+# broadcast on load-back. KDA/Mamba state and the DFlash draft KV stay
+# rank-local (TP-sharded).
+# Budget (K3: 24 MLA layers, kv_dim 576, fp8 => 13.8 KB/token, once;
+# 69 KDA layers => 28 MiB per state slot per rank; draft 8 kv heads / TP8,
+# 6 layers, bf16 => 3 KB/token/rank, mirrored to the target token count):
+#   140 GB MLA KV (~10.1M tokens)            ~130 GiB
+#   130 x 13.5 = 1755 KDA slots x 8 ranks    ~380 GiB
+#   draft L2 mirror x 8 ranks                ~232 GiB
+#   total                                    ~742 GiB (prod measured ~744 GiB peak)
+# Previous recipe: --hicache-ratio 3, no dedup = 8 replicas of 3 x 30.67 GB
+# (~686 GiB pinned for 6.7M unique tokens) + 390 KDA slots.
+# INVARIANT: --hicache-size, --hicache-mamba-ratio, --max-mamba-cache-size and
+# MEMORY_MIB are one coupled set; the prod recipe records that 709/743/797 GiB
+# variants SIGKILLed at boot. Change them together or not at all.
+HICACHE_SIZE_GB = "140"
+HICACHE_MAMBA_RATIO = "13.5"
+HICACHE_WRITE_POLICY = "write_through"  # prod lane value; was write_through_selective
 
 SGLANG_BASE_IMAGE = "modalresearch/sglang:kimi-k3-cu13-20260806-b9e90a6d6"
 SGLANG_COMMIT = "b9e90a6d6ef1859830c3b879cef999092975a41a"   # HEAD stays here
@@ -292,7 +309,11 @@ EXTRA_SERVER_ARGS = {
     "--cuda-graph-bs-decode": "1 2 4 8 12 16 24 32 48",
     "--enable-cache-report": "",
     "--enable-hierarchical-cache": "",
-    "--hicache-ratio": HICACHE_RATIO,
+    "--enable-mla-hicache-host-dedup": "",
+    "--hicache-size": HICACHE_SIZE_GB,
+    "--hicache-mamba-ratio": HICACHE_MAMBA_RATIO,
+    "--hicache-io-backend": "kernel",
+    "--hicache-mem-layout": "page_first",
     "--hicache-write-policy": HICACHE_WRITE_POLICY,
     "--speculative-algorithm": "DFLASH",
     "--speculative-attention-mode": "decode",

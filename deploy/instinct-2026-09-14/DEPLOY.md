@@ -1,4 +1,4 @@
-# kimi-k3-fast -> dev/instinct/2026-09-15 @ 3ccb60f5b, 4 PRs of #22 + #26 on
+# kimi-k3-fast -> dev/instinct/2026-09-15 @ 3ccb60f5b, 4 PRs of #22 + #26 on, HiCache MLA host dedup lane on
 
 Files in this directory:
 
@@ -16,7 +16,9 @@ Files in this directory:
      (#33, after the IPC stress soak), `SGLANG_PREFILL_CUDA_GRAPH_MIN_REPLAY_BUCKET=128` (#29) and the other
      default-off dev levers (#37/#38/#43) as their same-box rows land. Rollback of any flip = unset the var.
   3. warmup: one 1280x800 synthetic-PNG image turn after the text greeting (autoinference #516).
-  Unchanged: app name, model/draft, server args, volumes, B300:8, min_containers=63,
+  4. HiCache: the MLA host dedup lane (see section below) replaces `--hicache-ratio 3` /
+     `write_through_selective`; this is the only server-arg change.
+  Unchanged: app name, model/draft, other server args, volumes, B300:8, min_containers=63,
   routing/kv-aware routing, auth, heartbeat/terminate, JIT-cache salt (`SGLANG_EFFECTIVE_COMMIT`).
 
 ## Bundle generation (per validated dev merge)
@@ -60,6 +62,10 @@ Image build check (in the build log): `rev-parse HEAD == 3ccb60f5b...`, `status 
   warmup number now includes the image turn (expect +25-80 s on containers with a cold mm JIT).
 - Env check on a running container: `SGLANG_RELEASE_SHA=3ccb60f5b...` and the 7 flag lines above;
   `SGLANG_ENABLE_MM_CUDA_IPC_PREFIX_ACK` must be absent.
+- Dedup check in the scheduler log (see the HiCache section): TP0 logs
+  `HiCache startup phase=preflight ... role=owner` and TP1-7 log `role=receiver` plus
+  `MLATokenToKVPoolHost dummy mode: allocator-only`; `MLA host-dedup NCCL broadcast group warmup completed`
+  on every rank; no `Disabling MLA host-dedup` line.
 
 ## Rollback
 
@@ -107,8 +113,45 @@ existing `dflash_spec` mount (`DFlash2DraftModel`), `--speculative-draft-model-q
   `DRAFT_QUANTIZATION = "fp8"` + restore `"--speculative-draft-fp8-activation-scheme": "static"`,
   drop the `check_dflash2_checkpoint` call; redeploy.
 
+## HiCache MLA host dedup lane (deploy-only; engine unchanged at 3ccb60f5b)
+
+Copied from the Modal Flash K3 prod recipe (`autoinference/deployments/kimi_k3/prod_serve.py`,
+"dedup-HiCache lane": live on `kimi-k3-fprs-plus` since 2026-08-13, and at prod v10-v12 2026-08-03..06).
+Every engine commit it depends on (James Liu's `feat(kimi-k3): deduplicate hybrid MLA HiCache host KV`
+3980ae4ea2 through the 2026-08-17 HiCache V3 fixes 7768ec5556 / b3fd671a71) is an ancestor of 462ade71f,
+so no `RELEASE_SHA` bump is needed. `serve.py` `EXTRA_SERVER_ARGS`:
+
+```diff
+-    "--hicache-ratio": "3",
+-    "--hicache-write-policy": "write_through_selective",
++    "--enable-mla-hicache-host-dedup": "",
++    "--hicache-size": "140",
++    "--hicache-mamba-ratio": "13.5",
++    "--hicache-io-backend": "kernel",
++    "--hicache-mem-layout": "page_first",
++    "--hicache-write-policy": "write_through",
+```
+
+What it does: only attn-TP rank 0 allocates the MLA host KV pool (`--hicache-size` is that one pool, not
+per rank); ranks 1-7 hold allocator-only dummy pools and receive KV by a layerwise NCCL broadcast on
+load-back. KDA/Mamba state (`--hicache-mamba-ratio` x `--max-mamba-cache-size 130` = 1755 host slots) and the
+DFlash draft KV stay rank-local because they are TP-sharded. L2 only (no L3 storage backend), DCP must be 1.
+
+Host budget (K3 = 24 MLA + 69 KDA layers, fp8 MLA 13.8 KB/token; KDA 28 MiB/slot/rank; draft 3 KB/token/rank
+mirrored to the target token count): MLA KV ~130 GiB (~10.1M tokens) + KDA 1755 slots ~380 GiB + draft ~232 GiB
+= ~742 GiB, matching the ~744 GiB peak prod measured, under the 1 TiB request. The previous recipe pinned
+~686 GiB for 6.7M unique tokens (8 replicas) + 390 KDA slots. `--hicache-size`, `--hicache-mamba-ratio`,
+`--max-mamba-cache-size` and `MEMORY_MIB` are one coupled set: prod records 709/743/797 GiB variants
+SIGKILLing at boot. Do not change one without re-deriving the others.
+
+Rollback (engine may stay): restore the two removed lines and drop the six added ones, redeploy. Same-box
+flip test: p23 = current recipe, p24 = this recipe; probe36 must be greedy-identical; expect higher host-hit
+share (`sglang:cached_tokens_total{cache_source="host"}`) and fewer re-prefills after eviction.
+
 ## Not verified
 
+- The dedup lane on Instinct's traffic: no same-box A/B yet (prod-vetted on Modal Flash's kimi-k3-fprs-plus
+  only). `write_through` vs the previous `write_through_selective` is part of that A/B.
 - A B300:8 container boot with the image warmup turn (#516 is CI-green, not container-tested).
 - `modal deploy` from this directory against Instinct's workspace (only run in modal-labs/cust-instinct
   as `kimi-k3-ab-instinct`, 1 container, aws/us-east-1, offline HF layout).
