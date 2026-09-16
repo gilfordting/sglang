@@ -257,6 +257,7 @@ class TestHiCacheMLADedupDraftPlan(unittest.TestCase):
                     "get_memory",
                     return_value=SimpleNamespace(
                         enable_hierarchical_cache=True,
+                        enable_unified_cache_external_linker=False,
                         enable_mla_hicache_host_dedup=enabled,
                     ),
                 ),
