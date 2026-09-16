@@ -15,6 +15,7 @@ limitations under the License.
 
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -395,10 +396,17 @@ class HiCacheController:
         return getattr(self, "mla_dedup", None) is not None
 
     def set_producer_stream(self, stream) -> None:
+        # EXPERIMENT ONLY: SGLANG_MLA_DEDUP_FENCES=0 drops both dedup stream
+        # fences (D2H waits on forward; forward waits on last D2H finish).
+        if os.environ.get("SGLANG_MLA_DEDUP_FENCES", "1") != "1":
+            logger.warning("EXPERIMENT: MLA dedup stream fences disabled")
+            return
         if getattr(self, "mla_dedup", None) is not None:
             self.mla_dedup.producer_stream = stream
 
     def wait_for_last_write(self, stream) -> None:
+        if os.environ.get("SGLANG_MLA_DEDUP_FENCES", "1") != "1":
+            return
         finish_event = (
             self.mla_dedup.last_write_finish_event
             if getattr(self, "mla_dedup", None) is not None
