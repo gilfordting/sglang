@@ -799,6 +799,24 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "memory is available after target backend initialization.",
                     available_mem,
                 )
+        if envs.SGLANG_DFLASH_GRAPH_EMBED.get():
+            # Must run before capture: with `forward_embed` present the draft graph
+            # embeds the block itself (lookup + TP all-reduce captured), and the
+            # decode path below stops staging eager input_embeds.
+            draft_model = self.draft_model_runner.model
+            if hasattr(draft_model, "attach_target_embedding"):
+                draft_model.attach_target_embedding(
+                    self._target_worker.model_runner.model.get_input_embeddings()
+                )
+                if self.ps.tp_rank == 0:
+                    logger.info(
+                        "DFLASH draft embeds its block in-graph (SGLANG_DFLASH_GRAPH_EMBED=1)."
+                    )
+            elif self.ps.tp_rank == 0:
+                logger.warning(
+                    "SGLANG_DFLASH_GRAPH_EMBED=1 ignored: draft model %s has no attach_target_embedding.",
+                    type(draft_model).__name__,
+                )
         if capture_decode_cuda_graph:
             # Must run before capture so the draft graph folds the head in.
             self._draft_sampler = self._maybe_build_draft_sampler()
@@ -2434,8 +2452,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
-        noise_embedding = embed_module(block_ids)
-        input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
+        if hasattr(self.draft_model_runner.model, "forward_embed"):
+            # Draft embeds the block inside its graph (SGLANG_DFLASH_GRAPH_EMBED).
+            input_embeds = None
+        else:
+            noise_embedding = embed_module(block_ids)
+            input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)

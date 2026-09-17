@@ -662,6 +662,21 @@ class DFlashDraftModel(nn.Module):
         target_hidden, _ = self.fc(target_hidden)
         return self.hidden_norm(target_hidden)
 
+    def attach_target_embedding(self, embed_tokens: nn.Module) -> None:
+        """Make the draft embed its own block inside the draft CUDA graph.
+
+        Exposes `forward_embed` (the runner then skips staging eager
+        `input_embeds`, and `forward` looks the ids up itself), using the target's
+        VocabParallelEmbedding so the lookup + TP all-reduce are captured in the
+        graph instead of running eagerly every step. The module is stored as a
+        plain attribute so it is not registered as a draft submodule."""
+        object.__setattr__(self, "_target_embed_tokens", embed_tokens)
+
+        def forward_embed(input_ids: torch.Tensor) -> torch.Tensor:
+            return embed_tokens(input_ids)
+
+        object.__setattr__(self, "forward_embed", forward_embed)
+
     @torch.no_grad()
     def forward(
         self,
