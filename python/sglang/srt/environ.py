@@ -508,6 +508,8 @@ class Envs:
     # intentionally below 1 TiB: per-process availability checks race when
     # eight TP ranks allocate replicated sidecars concurrently.
     SGLANG_HICACHE_HOST_BUDGET_GIB = EnvInt(800)
+    # Deterministic top-p/top-k renorm (port of upstream ab2b2fca5f for the RCA fix check).
+    SGLANG_RENORM_DETERMINISTIC = EnvBool(True)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)

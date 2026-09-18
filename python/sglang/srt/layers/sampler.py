@@ -33,7 +33,7 @@ if is_cuda():
         min_p_sampling_from_probs,
         top_k_top_p_sampling_from_probs,
     )
-    from sgl_kernel import (
+    from sglang.srt.layers.sampling_renorm import (
         top_k_renorm_prob,
         top_p_renorm_prob,
     )
