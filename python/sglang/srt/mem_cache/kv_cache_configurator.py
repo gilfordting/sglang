@@ -1487,6 +1487,12 @@ class KVCacheConfigurator:
             enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
             **pool_kwargs,
         )
+        # RCA: stamp the GQA replication factor on plain (non-hybrid) MHA pools
+        # too, mirroring the hybrid builder, so HiRadixCache host dedup engages.
+        total_kv_heads = self.model_config.get_total_num_kv_heads()
+        attn_tp_size = get_parallel().attn_tp_size
+        if 0 < total_kv_heads < attn_tp_size and attn_tp_size % total_kv_heads == 0:
+            token_to_kv_pool.hicache_dedup_kv_replicas = attn_tp_size // total_kv_heads
         return token_to_kv_pool
 
     def _build_token_to_kv_pool_allocator(
