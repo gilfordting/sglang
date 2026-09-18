@@ -254,3 +254,8 @@ def inject_load_fail() -> bool:
         print(f"[DEDUP_RCA] rank {_rank()}: INJECTING load-back failure #{_INJECT_COUNT}", file=sys.stderr, flush=True)
         return True
     return False
+
+
+def crc_strs(items) -> int:
+    """Order-sensitive CRC32 over strings (hash() is per-process randomized)."""
+    return zlib.crc32("|".join(str(s) for s in items).encode())

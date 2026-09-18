@@ -3180,7 +3180,7 @@ class Scheduler(
                     "load_q": len(_cc.load_queue) if _cc is not None else -1,
                     "write_q": len(_cc.write_queue) if _cc is not None else -1,
                     "node_ctr": _rca.node_counter(),
-                    "waiting_crc": _rca.crc([hash(r.rid) & 0x7FFFFFFF for r in self.waiting_queue]),
+                    "waiting_crc": _rca.crc_strs([r.rid for r in self.waiting_queue]),
                 }
                 _rca.fingerprint("step", _st)
             self.tree_cache.check_hicache_events()
