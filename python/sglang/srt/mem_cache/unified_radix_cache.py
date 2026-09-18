@@ -1071,11 +1071,14 @@ class UnifiedRadixCache(BasePrefixCache):
         # Load H→D
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
-        device_indices = self.cache_controller.load(
-            host_indices=kv_xfer.host_indices,
-            node_id=node_id,
-            extra_pools=aux_xfers or None,
-        )
+        if _rca.inject_load_fail():
+            device_indices = None  # fault injection: rank-local alloc failure
+        else:
+            device_indices = self.cache_controller.load(
+                host_indices=kv_xfer.host_indices,
+                node_id=node_id,
+                extra_pools=aux_xfers or None,
+            )
 
         self.dec_lock_ref(node_id, ancestor_lock_params)
         _rca.log("load_back.alloc", node=node_id, kv_tokens=kv_tokens,

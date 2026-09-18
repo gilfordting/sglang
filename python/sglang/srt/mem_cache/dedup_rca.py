@@ -39,6 +39,14 @@ _LOCK = threading.Lock()
 _STALL_SECONDS = float(os.environ.get("SGLANG_DEDUP_RCA_STALL_SECONDS", "90"))
 _MISMATCHES = 0
 _FAIL_STOP = os.environ.get("SGLANG_DEDUP_RCA_FAIL_STOP", "1") == "1"
+# SGLANG_DEDUP_RCA_FP=0 keeps the decision logs + stall dump but skips the
+# gloo fingerprints, so the production hang signature can reproduce as-is.
+_FP_ENABLED = os.environ.get("SGLANG_DEDUP_RCA_FP", "1") == "1"
+# Fault injection: on rank INJECT_RANK, the INJECT_AFTER-th load-back
+# (1-based) is forced to fail as if the device allocator returned None.
+_INJECT_RANK = int(os.environ.get("SGLANG_DEDUP_RCA_INJECT_LOAD_FAIL_RANK", "-1"))
+_INJECT_AFTER = int(os.environ.get("SGLANG_DEDUP_RCA_INJECT_LOAD_FAIL_AFTER", "0"))
+_INJECT_COUNT = 0
 
 
 def enabled() -> bool:
@@ -130,7 +138,7 @@ def fingerprint(tag: str, fields: dict, extra: Optional[dict] = None) -> bool:
     Returns True when all ranks agree. ``extra`` is rank-local detail that is
     only printed when a mismatch is detected.
     """
-    if not enabled():
+    if not enabled() or not _FP_ENABLED:
         return True
     group = _cpu_group()
     if group is None or not torch.distributed.is_initialized():
@@ -233,3 +241,16 @@ def node_counter() -> int:
         return int(UnifiedTreeNode.counter)
     except Exception:
         return -1
+
+
+def inject_load_fail() -> bool:
+    """True exactly once, on the configured rank's N-th load-back (fault injection)."""
+    global _INJECT_COUNT
+    if not enabled() or _INJECT_RANK < 0 or _rank() != _INJECT_RANK:
+        return False
+    _INJECT_COUNT += 1
+    if _INJECT_COUNT == _INJECT_AFTER:
+        log("INJECT_LOAD_FAIL", count=_INJECT_COUNT)
+        print(f"[DEDUP_RCA] rank {_rank()}: INJECTING load-back failure #{_INJECT_COUNT}", file=sys.stderr, flush=True)
+        return True
+    return False
