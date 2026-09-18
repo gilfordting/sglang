@@ -47,6 +47,8 @@ _FP_ENABLED = os.environ.get("SGLANG_DEDUP_RCA_FP", "1") == "1"
 _INJECT_RANK = int(os.environ.get("SGLANG_DEDUP_RCA_INJECT_LOAD_FAIL_RANK", "-1"))
 _INJECT_AFTER = int(os.environ.get("SGLANG_DEDUP_RCA_INJECT_LOAD_FAIL_AFTER", "0"))
 _INJECT_COUNT = 0
+# Only count load-backs carrying at least this many KV tokens (default: KV loads only).
+_INJECT_MIN_KV = int(os.environ.get("SGLANG_DEDUP_RCA_INJECT_MIN_KV", "1"))
 
 
 def enabled() -> bool:
@@ -243,10 +245,12 @@ def node_counter() -> int:
         return -1
 
 
-def inject_load_fail() -> bool:
-    """True exactly once, on the configured rank's N-th load-back (fault injection)."""
+def inject_load_fail(kv_tokens: int = 0) -> bool:
+    """True exactly once, on the configured rank's N-th qualifying load-back."""
     global _INJECT_COUNT
     if not enabled() or _INJECT_RANK < 0 or _rank() != _INJECT_RANK:
+        return False
+    if kv_tokens < _INJECT_MIN_KV:
         return False
     _INJECT_COUNT += 1
     if _INJECT_COUNT == _INJECT_AFTER:

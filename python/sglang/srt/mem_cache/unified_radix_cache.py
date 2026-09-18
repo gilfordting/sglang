@@ -1071,7 +1071,7 @@ class UnifiedRadixCache(BasePrefixCache):
         # Load H→D
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
-        if _rca.inject_load_fail():
+        if _rca.inject_load_fail(kv_tokens):
             device_indices = None  # fault injection: rank-local alloc failure
         else:
             device_indices = self.cache_controller.load(
