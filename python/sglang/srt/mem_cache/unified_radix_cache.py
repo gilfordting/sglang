@@ -617,6 +617,10 @@ class UnifiedRadixCache(BasePrefixCache):
             return
 
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
+        if _rca.enabled():
+            _rca.log("cache_finished", rid=req.rid, kv_len=kv_len_to_handle,
+                     n_out=len(req.output_ids), tok_crc=_rca.crc(list(token_ids)),
+                     tail_crc=_rca.crc(list(token_ids[-64:])))
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_len_to_handle
         ]
@@ -696,6 +700,10 @@ class UnifiedRadixCache(BasePrefixCache):
             return
 
         token_ids = req.get_fill_ids()
+        if _rca.enabled():
+            _rca.log("cache_unfinished", rid=req.rid, chunked=int(chunked),
+                     n_tok=len(token_ids), tok_crc=_rca.crc(list(token_ids)),
+                     tail_crc=_rca.crc(list(token_ids[-64:])))
 
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
