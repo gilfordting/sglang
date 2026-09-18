@@ -3311,7 +3311,7 @@ class Scheduler(
                 _rca.log("match", rid=req.rid, prefix=len(req.prefix_indices),
                          host_hit=req.host_hit_length, mamba_hit=req.mamba_host_hit_length,
                          last_node=req.last_node, best=req.best_match_node,
-                         last_host=req.last_host_node, fill=len(req.fill_ids),
+                         last_host=req.last_host_node, fill=len(req.full_untruncated_fill_ids),
                          mamba_idx=req.mamba_pool_idx)
             res = adder.add_one_req(
                 req,
