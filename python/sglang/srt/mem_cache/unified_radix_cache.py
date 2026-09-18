@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache import dedup_rca as _rca
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -434,6 +435,10 @@ class UnifiedRadixCache(BasePrefixCache):
             self.writing_check(write_back=True)
 
         self.update_eviction_metrics(sum(tracker.values()), start_time)
+        _rca.log("evict", req_full=params.num_tokens, req_mamba=params.mamba_num,
+                 got_full=tracker[BASE_COMPONENT_TYPE],
+                 got_mamba=tracker.get(ComponentType.MAMBA, 0),
+                 dev_avail=int(self.token_to_kv_pool_allocator.available_size()))
         return EvictResult(
             num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
             swa_num_tokens_evicted=tracker.get(ComponentType.SWA, 0),
@@ -859,6 +864,8 @@ class UnifiedRadixCache(BasePrefixCache):
         """Evict host resources for a specific component to free host pool space."""
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
         self._free_values(result.device_frees, result.host_frees)
+        _rca.log("evict_host", comp=str(component_type), req=num_tokens,
+                 got=result.tracker.get(component_type, 0))
         return result.tracker.get(component_type, 0)
 
     # ---- HiCache: Backup / LoadBack ----
@@ -900,13 +907,22 @@ class UnifiedRadixCache(BasePrefixCache):
         host_avail = self.cache_controller.mem_pool_host.available_size()
         if host_avail < kv_tokens:
             needed = kv_tokens - host_avail
-            if self.evict_host(needed) < needed:
+            evicted = self.evict_host(needed)
+            _rca.log("backup.evict_host", node=node_id, host_avail=host_avail,
+                     needed=needed, evicted=evicted)
+            if evicted < needed:
+                _rca.log("backup.FAIL_evict_host", node=node_id)
                 return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
-        return self.cache_controller.write(
+        _hi = self.cache_controller.write(
             device_value, node_id=node_id, extra_pools=aux_xfers or None
         )
+        _rca.log("backup.write", node=node_id, kv_tokens=kv_tokens,
+                 ok=int(_hi is not None), host_idx=_hi,
+                 n_aux=len(aux_xfers),
+                 host_avail_after=int(self.cache_controller.mem_pool_host.available_size()))
+        return _hi
 
     def _track_write_through_node(
         self,
@@ -1010,6 +1026,19 @@ class UnifiedRadixCache(BasePrefixCache):
         sidecar_xfers = self._build_sidecar_transfers(
             CacheTransferPhase.LOAD_BACK, kv_xfer, comp_xfers
         )
+        if _rca.enabled():
+            _rca.log(
+                "load_back.spec",
+                rid=getattr(req, "rid", None),
+                node=node_id,
+                kv_tokens=kv_tokens,
+                host_idx=kv_xfer.host_indices,
+                nodes_to_load=list(kv_xfer.nodes_to_load or ()),
+                comp={str(k): [(t.name, None if t.host_indices is None else int(t.host_indices.numel())) for t in v] for k, v in comp_xfers.items()},
+                mem_quota=mem_quota,
+                delta=result.delta,
+                threshold=self.load_back_threshold,
+            )
 
         # Skip if there is nothing to load, or if the Full-KV transfer is too
         # small / exceeds memory quota. Aux transfers should still run even
@@ -1017,6 +1046,8 @@ class UnifiedRadixCache(BasePrefixCache):
         if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
             mem_quota is not None and kv_tokens > mem_quota + result.delta
         ):
+            _rca.log("load_back.SKIP_threshold", node=node_id, kv_tokens=kv_tokens,
+                     comp=len(comp_xfers), mem_quota=mem_quota, delta=result.delta)
             self.dec_lock_ref(node_id, ancestor_lock_params)
             self.dec_host_lock_ref(node_id, host_anchor_params)
             return False
@@ -1028,7 +1059,11 @@ class UnifiedRadixCache(BasePrefixCache):
         if avail < kv_tokens:
             needed = kv_tokens - avail
             result = self.evict(EvictParams(num_tokens=needed))
+            _rca.log("load_back.evict", node=node_id, avail=avail, needed=needed,
+                     evicted=result.num_tokens_evicted)
             if result.num_tokens_evicted < needed:
+                _rca.log("load_back.FAIL_evict", node=node_id, avail=avail, needed=needed,
+                         evicted=result.num_tokens_evicted)
                 self.dec_lock_ref(node_id, ancestor_lock_params)
                 self.dec_host_lock_ref(node_id, host_anchor_params)
                 return False
@@ -1043,6 +1078,9 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         self.dec_lock_ref(node_id, ancestor_lock_params)
+        _rca.log("load_back.alloc", node=node_id, kv_tokens=kv_tokens,
+                 ok=int(device_indices is not None),
+                 dev_avail_after=int(self.token_to_kv_pool_allocator.available_size()))
         if device_indices is None:
             self.dec_host_lock_ref(node_id, host_anchor_params)
             return False
@@ -1849,6 +1887,7 @@ class UnifiedRadixCache(BasePrefixCache):
         while finish_count > 0:
             ack = cc.ack_write_queue.pop(0)
             ack.finish_event.synchronize()
+            _rca.log("ack.write", nodes=list(ack.node_ids))
             for ack_id in ack.node_ids:
                 self._finish_write_through_ack(ack_id)
             finish_count -= 1
@@ -1873,6 +1912,7 @@ class UnifiedRadixCache(BasePrefixCache):
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
+            _rca.log("ack.load", nodes=list(ack.node_ids), tokens=ack.num_tokens)
             for ack_id in ack.node_ids:
                 node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node, lock_params)
@@ -1900,6 +1940,18 @@ class UnifiedRadixCache(BasePrefixCache):
         req = params.req
         assert req is not None
         last_best_match_device_node_id = req.last_node
+        if _rca.enabled():
+            _rca.log(
+                "init_load_back",
+                rid=req.rid,
+                best=best_match_node_id,
+                last_dev=last_best_match_device_node_id,
+                full_evicted=int(self.tree_core.is_full_device_evicted(best_match_node_id)),
+                host_hit=params.host_hit_length,
+                swa_hit=req.swa_host_hit_length,
+                mamba_hit=req.mamba_host_hit_length,
+                mamba_idx=req.mamba_pool_idx,
+            )
 
         if (
             self.tree_core.is_full_device_evicted(best_match_node_id)
@@ -1976,6 +2028,22 @@ class UnifiedRadixCache(BasePrefixCache):
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""
         if self.cache_controller is not None:
+            if _rca.enabled():
+                cc = self.cache_controller
+                summ = _rca.summarize_ops(cc.load_queue)
+                summ["dev_avail"] = int(self.token_to_kv_pool_allocator.available_size())
+                summ["host_avail"] = int(cc.mem_pool_host.available_size())
+                summ["ongoing_load"] = len(self.ongoing_load_back)
+                summ["ongoing_wt"] = len(self.ongoing_write_through)
+                summ["ack_load_q"] = len(cc.ack_load_queue)
+                summ["ack_write_q"] = len(cc.ack_write_queue)
+                detail = [
+                    (op.node_ids, int(op.host_indices.numel()),
+                     [(t.name, None if t.host_indices is None else int(t.host_indices.numel()))
+                      for t in (op.pool_transfers or [])])
+                    for op in cc.load_queue
+                ]
+                _rca.fingerprint("load_ops", summ, extra={"ops": detail})
             return self.cache_controller.start_loading()
         return 0
 

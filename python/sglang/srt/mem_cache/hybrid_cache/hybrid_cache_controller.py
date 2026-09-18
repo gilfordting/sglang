@@ -34,6 +34,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.memory_pool_host import PoolEntry
+from sglang.srt.mem_cache import dedup_rca as _rca
 from sglang.srt.mem_cache.hicache_host_dedup import (
     HostDedupPrebuild,
     storage_supports_host_dedup,
@@ -434,6 +435,11 @@ class HybridCacheController(BaseHiCacheController):
         self.write_queue.clear()
         start_event = device_module.Event()
         finish_event = device_module.Event()
+        _rca.log("ctrl.start_writing", nodes=list(op.node_ids),
+                 kv=int(op.host_indices.numel()),
+                 xfers=[(t.name, None if t.host_indices is None else int(t.host_indices.numel()))
+                        for t in (op.pool_transfers or [])],
+                 skip_io=int(self._dedup_skip_host_io))
         rank_local_pool_names = {PoolName.MAMBA}
         has_rank_local_transfers = any(
             transfer.name in rank_local_pool_names
@@ -565,6 +571,12 @@ class HybridCacheController(BaseHiCacheController):
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
         self.load_queue.clear()
+        _rca.log("ctrl.start_loading", producer=producer_id, nodes=list(op.node_ids),
+                 kv=int(op.host_indices.numel()),
+                 xfers=[(t.name, None if t.host_indices is None else int(t.host_indices.numel()))
+                        for t in (op.pool_transfers or [])],
+                 dedup=int(self.host_dedup_broadcast_enabled),
+                 is_src=int(getattr(self.host_dedup_broadcaster, "is_src", -1)) if self.host_dedup_broadcaster else -1)
         if self.host_dedup_broadcast_enabled:
             return self._start_loading_mla(producer_id, op)
         host_indices, device_indices, resolved_pool_transfers = (

@@ -256,6 +256,7 @@ from sglang.srt.managers.utils import (
     is_health_check_generate_req,
     validate_input_length,
 )
+from sglang.srt.mem_cache import dedup_rca as _rca
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
@@ -2980,6 +2981,7 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
+        _rca.heartbeat()
         self.process_pending_chunked_abort()
 
         if self.enable_fpm:
@@ -3157,6 +3159,30 @@ class Scheduler(
                 self._add_request_to_queue(req)
 
         if self.enable_hierarchical_cache or get_memory().enable_flexkv:
+            if _rca.enabled():
+                _tc = self.tree_cache
+                _ma = getattr(self.req_to_token_pool, "mamba_allocator", None)
+                _cc = getattr(_tc, "cache_controller", None)
+                _st = {
+                    "waiting": len(self.waiting_queue),
+                    "running": running_batch.batch_size(),
+                    "chunked": int(self.chunked_req is not None),
+                    "dev_avail": int(self.token_to_kv_pool_allocator.available_size()),
+                    "req_avail": int(self.req_to_token_pool.available_size()),
+                    "mamba_avail": int(_ma.available_size()) if _ma is not None else -1,
+                    "evictable": int(_tc.evictable_size()),
+                    "full_evictable": int(getattr(_tc, "full_evictable_size", lambda: -1)()),
+                    "host_avail": int(_cc.mem_pool_host.available_size()) if _cc is not None else -1,
+                    "ongoing_load": len(getattr(_tc, "ongoing_load_back", ())),
+                    "ongoing_wt": len(getattr(_tc, "ongoing_write_through", ())),
+                    "ack_load_q": len(_cc.ack_load_queue) if _cc is not None else -1,
+                    "ack_write_q": len(_cc.ack_write_queue) if _cc is not None else -1,
+                    "load_q": len(_cc.load_queue) if _cc is not None else -1,
+                    "write_q": len(_cc.write_queue) if _cc is not None else -1,
+                    "node_ctr": _rca.node_counter(),
+                    "waiting_crc": _rca.crc([hash(r.rid) & 0x7FFFFFFF for r in self.waiting_queue]),
+                }
+                _rca.fingerprint("step", _st)
             self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
@@ -3281,11 +3307,22 @@ class Scheduler(
                     req.storage_hit_length = loaded_tokens
 
             req.init_next_round_input(self.tree_cache)
+            if _rca.enabled():
+                _rca.log("match", rid=req.rid, prefix=len(req.prefix_indices),
+                         host_hit=req.host_hit_length, mamba_hit=req.mamba_host_hit_length,
+                         last_node=req.last_node, best=req.best_match_node,
+                         last_host=req.last_host_node, fill=len(req.fill_ids),
+                         mamba_idx=req.mamba_pool_idx)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            if _rca.enabled():
+                _rca.log("add_one_req", rid=req.rid, res=str(res),
+                         prefix=len(req.prefix_indices), last_node=req.last_node,
+                         rem_total=int(adder.rem_total_tokens),
+                         can_run=len(adder.can_run_list))
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -3461,6 +3498,8 @@ class Scheduler(
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
                 self.server_args
             )
+            _rca.log("retract", n=len(retracted_reqs), rids=[r.rid for r in retracted_reqs],
+                     abort=len(reqs_to_abort))
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
             mamba_num_gained = (
@@ -4396,6 +4435,8 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            _rca.log("abort.waiting", rid=req.rid, mamba_idx=req.mamba_pool_idx,
+                     prefix=len(req.prefix_indices))
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
