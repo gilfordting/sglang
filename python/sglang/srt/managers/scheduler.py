@@ -546,15 +546,27 @@ class Scheduler(
         # captured hidden states rebuild the drafter's window through the
         # ordinary extend path. Without this, resumed requests draft blind
         # until `window` fresh tokens accumulate.
+        #
+        # A PD decode worker never prefills: its ring is filled by the
+        # prefill side's draft-KV tail transfer (DFLASH_KV state component,
+        # see disaggregation/decode.py), independent of any decode-side
+        # radix hit on the target KV. Leave its matches uncapped so a prefix
+        # hit does not force prefill to resend a ring-sized tail of target KV.
         if getattr(self.draft_worker, "use_draft_ring", False):
-            self.tree_cache.dflash_draft_ring_reprefill_tail_tokens = int(
-                self.draft_worker.draft_ring_tokens
-            )
-            logger.info(
-                "DFLASH draft ring: capping prefix-cache matches by %s tail "
-                "tokens (cache-hit resumes re-prefill the drafter window).",
-                self.draft_worker.draft_ring_tokens,
-            )
+            if self.server_args.disaggregation_mode == "decode":
+                logger.info(
+                    "DFLASH draft ring on PD decode: prefix-cache matches "
+                    "uncapped (the ring is fed by prefill's draft-KV tail)."
+                )
+            else:
+                self.tree_cache.dflash_draft_ring_reprefill_tail_tokens = int(
+                    self.draft_worker.draft_ring_tokens
+                )
+                logger.info(
+                    "DFLASH draft ring: capping prefix-cache matches by %s tail "
+                    "tokens (cache-hit resumes re-prefill the drafter window).",
+                    self.draft_worker.draft_ring_tokens,
+                )
 
         # Init running status
         self.init_running_status()

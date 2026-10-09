@@ -2243,7 +2243,7 @@ class ServerArgs:
     ] = None
     speculative_dflash_draft_ring: A[
         bool,
-        "EXPERIMENTAL, DFLASH only, requires --speculative-draft-window-size. Keep the draft model's KV in a fixed per-request ring sized to the draft window (own small allocation with a static request->slot map) instead of sharing the target's global KV index space. Frees pool-sized draft KV back to the target; costs a ring-sized tail re-prefill on every prefix-cache-hit resume (the ring is slot-keyed, so cached draft context cannot be reused). Prefer for memory-tight or long-context deployments with low prefix-hit traffic; the default shared-index compact cache remains better for cache-heavy multi-turn serving.",
+        "EXPERIMENTAL, DFLASH only, requires --speculative-draft-window-size. Keep the draft model's KV in a fixed per-request ring sized to the draft window (own small allocation with a static request->slot map) instead of sharing the target's global KV index space. Frees pool-sized draft KV back to the target; costs a ring-sized tail re-prefill on every prefix-cache-hit resume (the ring is slot-keyed, so cached draft context cannot be reused). Prefer for memory-tight or long-context deployments with low prefix-hit traffic; the default shared-index compact cache remains better for cache-heavy multi-turn serving. PD disaggregation: DECODE-side only (NIXL transfer backend): the prefill worker keeps the default full draft KV and its last-window draft-KV tail is written straight into the decode worker's ring; rejected on a prefill worker.",
         NS("spec"),
     ] = False
     speculative_moe_runner_backend: A[
@@ -6309,6 +6309,26 @@ class ServerArgs:
                 "--speculative-dflash-draft-ring requires a resolved "
                 "--speculative-num-draft-tokens (ring capacity covers "
                 "window + draft block)."
+            )
+        # PD: the ring is a DECODE-side layout. Prefill must keep the full
+        # draft KV so its last-window tail can be sent (DFLASH_KV state
+        # component, NIXL only); a prefill ring is never transferred, which
+        # would leave the decode drafter blind for the whole request.
+        if self.disaggregation_mode == "prefill":
+            raise ValueError(
+                "--speculative-dflash-draft-ring is decode-only under PD "
+                "disaggregation: run the prefill worker without it (its "
+                "full draft KV tail feeds the decode worker's ring)."
+            )
+        if (
+            self.disaggregation_mode == "decode"
+            and self.disaggregation_transfer_backend != "nixl"
+        ):
+            raise ValueError(
+                "--speculative-dflash-draft-ring with --disaggregation-mode "
+                "decode requires --disaggregation-transfer-backend nixl (the "
+                "draft-KV tail arrives as a DFLASH_KV state component), got "
+                f"{self.disaggregation_transfer_backend!r}."
             )
 
     def _handle_legacy_cp_arguments(self):

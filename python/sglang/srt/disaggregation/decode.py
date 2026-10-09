@@ -291,6 +291,97 @@ class DecodeRequest:
         return self.req.priority
 
 
+@dataclass(frozen=True)
+class _DFlashDraftRingPD:
+    """Decode-side DFlash draft ring as a PD transfer / retraction target.
+
+    Under --speculative-dflash-draft-ring the draft KV lives in a private pool
+    addressed by the static map (row r, position p) ->
+    ring_page_offset + r * ring_tokens + p % ring_tokens, so neither the
+    target's req_to_token table nor the target allocator says where a draft
+    token lives. This object owns the two places decode needs ring-space
+    locations: the DFLASH_KV destination pages for prefill's draft-KV tail,
+    and the CPU backup/restore of that tail across retraction (ring slots
+    are keyed by req_pool_idx, which can change on resume).
+    """
+
+    draft_pool: Any
+    ring_tokens: int
+    ring_page_offset: int
+    page_size: int
+    window_size: int
+
+    @classmethod
+    def from_draft_worker(cls, draft_worker, draft_pool, server_args):
+        ring_tokens = int(draft_worker.draft_ring_tokens)
+        offset = int(getattr(draft_worker, "_ring_page_offset", 0))
+        page_size = int(draft_pool.page_size)
+        window = server_args.speculative_draft_window_size
+        if ring_tokens <= 0 or offset <= 0:
+            raise RuntimeError(
+                "DFLASH PD decode: draft ring is not installed yet "
+                f"(ring_tokens={ring_tokens}, page_offset={offset}); the "
+                "decode queue must be built after alloc_memory_pool."
+            )
+        if window is None:
+            raise RuntimeError(
+                "DFLASH PD decode: draft ring needs --speculative-draft-window-size"
+            )
+        return cls(
+            draft_pool=draft_pool,
+            ring_tokens=ring_tokens,
+            ring_page_offset=offset,
+            page_size=page_size,
+            window_size=int(window),
+        )
+
+    def tail_slots(self, req_pool_idx: int, seq_len: int) -> np.ndarray:
+        from sglang.srt.speculative.dflash_kv_layout import draft_ring_tail_slots
+
+        return draft_ring_tail_slots(
+            req_pool_idx=req_pool_idx,
+            seq_len=seq_len,
+            window_size=self.window_size,
+            page_size=self.page_size,
+            ring_tokens=self.ring_tokens,
+            ring_page_offset=self.ring_page_offset,
+        )
+
+    def transfer_page_indices(self, req_pool_idx: int, seq_len: int) -> np.ndarray:
+        from sglang.srt.speculative.dflash_kv_layout import (
+            draft_ring_transfer_page_indices,
+        )
+
+        return draft_ring_transfer_page_indices(
+            req_pool_idx=req_pool_idx,
+            seq_len=seq_len,
+            window_size=self.window_size,
+            page_size=self.page_size,
+            ring_tokens=self.ring_tokens,
+            ring_page_offset=self.ring_page_offset,
+        )
+
+    # --- retraction backup (called from Req.offload_kv_cache/load_kv_cache)
+    def _slot_tensor(self, req_pool_idx: int, seq_len: int) -> torch.Tensor:
+        return torch.from_numpy(self.tail_slots(req_pool_idx, seq_len)).to(
+            self.draft_pool.device
+        )
+
+    def offload(self, req_pool_idx: int, seq_len: int):
+        """CPU copy of the ring tail [tail_start, seq_len) of this row."""
+        if seq_len <= 0:
+            return None
+        return self.draft_pool.get_cpu_copy(self._slot_tensor(req_pool_idx, seq_len))
+
+    def load(self, cpu_copy, req_pool_idx: int, seq_len: int) -> None:
+        """Restore a tail from `offload` into (possibly another) row's ring."""
+        if cpu_copy is None:
+            return
+        self.draft_pool.load_cpu_copy(
+            cpu_copy, self._slot_tensor(req_pool_idx, seq_len)
+        )
+
+
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     """
     Store the requests that are preallocating.
@@ -462,25 +553,57 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_data_lens += device_kv_data_lens[c4_layer_num:]
             kv_item_lens += device_kv_item_lens[c4_layer_num:]
             kv_data_mem_kinds += ["VRAM"] * len(device_kv_data_ptrs[c4_layer_num:])
-        draft_full = (
+        is_dflash_draft = (
             self.draft_token_to_kv_pool is not None
             and self.scheduler.spec_algorithm.is_dflash()
-            and not getattr(self.scheduler.draft_worker, "use_draft_ring", False)
         )
-        if draft_full:
+        use_draft_ring = bool(
+            getattr(self.scheduler.draft_worker, "use_draft_ring", False)
+        )
+        draft_full = is_dflash_draft and not use_draft_ring
+        # Decode-side draft ring (--speculative-dflash-draft-ring): the draft
+        # pool is the small private ring, not a pool-sized mirror of the
+        # target's index space. Prefill keeps the full draft KV and sends the
+        # last-window tail as the DFLASH_KV state component; decode lands it
+        # straight in the request's ring slots (see _pd_dflash_ring below and
+        # dflash_kv_layout.draft_ring_transfer_page_indices).
+        draft_ring = is_dflash_draft and use_draft_ring
+        self._pd_dflash_ring: Optional[_DFlashDraftRingPD] = None
+        if draft_full or draft_ring:
             if self.transfer_backend != TransferBackend.NIXL:
                 raise NotImplementedError(
                     "Full DFlash PD KV transfer currently requires NIXL"
                 )
-            # The draft shares logical slots, not the target's DCP physical rows.
+            # Register the draft pool as its own DFLASH_KV state component
+            # (setup_state_kv_args). Full mode: the draft shares logical slots,
+            # not the target's DCP physical rows. Ring mode: the component is
+            # the ring pool itself.
             self.draft_token_to_kv_pool._pd_dflash_full_kv = True
+        if draft_full:
             # Retraction resumes directly into decode, so preserve draft KV
             # together with target KV and Mamba state before releasing slots.
             if isinstance(self.token_to_kv_pool, HybridLinearKVPool):
                 self.token_to_kv_pool._pd_dflash_draft_kv_pool = (
                     self.draft_token_to_kv_pool
                 )
-        if self.draft_token_to_kv_pool is not None and not draft_full:
+        if draft_ring:
+            self._pd_dflash_ring = _DFlashDraftRingPD.from_draft_worker(
+                self.scheduler.draft_worker,
+                self.draft_token_to_kv_pool,
+                self.scheduler.server_args,
+            )
+            # Retraction: ring slots are keyed by req_pool_idx, so the row's
+            # draft tail is backed up by position and restored into whatever
+            # row the request resumes on (Req.offload_kv_cache/load_kv_cache).
+            self.token_to_kv_pool._pd_dflash_draft_ring = self._pd_dflash_ring
+            logger.info(
+                "DFLASH PD decode: draft ring fed by prefill's draft-KV tail "
+                "(ring_tokens=%s page=%s window=%s).",
+                self._pd_dflash_ring.ring_tokens,
+                self._pd_dflash_ring.page_size,
+                self._pd_dflash_ring.window_size,
+            )
+        if self.draft_token_to_kv_pool is not None and not (draft_full or draft_ring):
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
@@ -496,7 +619,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_item_lens = kv_item_lens
         kv_args.kv_layer_ids = (
             self.token_to_kv_pool.get_kv_layer_ids()
-            if (self.draft_token_to_kv_pool is None or draft_full)
+            if (self.draft_token_to_kv_pool is None or draft_full or draft_ring)
             and hasattr(self.token_to_kv_pool, "get_kv_layer_ids")
             else []
         )
@@ -1243,6 +1366,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     clear_c128_state(int(decode_req.req.req_pool_idx))
             for st in state_types:
                 if st == StateType.DFLASH_KV:
+                    if self._pd_dflash_ring is not None:
+                        # Destination = this row's ring slots for the tail
+                        # positions (static map), NOT the target's
+                        # req_to_token: the ring has its own index space.
+                        state_indices.append(
+                            self._pd_dflash_ring.transfer_page_indices(
+                                int(decode_req.req.req_pool_idx), seq_len
+                            )
+                        )
+                        continue
                     from sglang.srt.speculative.dflash_kv_layout import (
                         draft_kv_transfer_start,
                     )

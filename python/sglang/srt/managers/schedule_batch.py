@@ -1600,6 +1600,12 @@ class Req(ReqDllmMixin):
         self.kv_cache_cpu = token_to_kv_pool_allocator.get_cpu_copy(
             token_indices, mamba_indices=self.mamba_pool_idx
         )
+        # PD decode with the DFlash draft ring: the draft tail lives in ring
+        # slots keyed by req_pool_idx (not by token_indices), so back it up by
+        # position and restore it into the row the request resumes on.
+        ring = self._pd_dflash_draft_ring(token_to_kv_pool_allocator)
+        if ring is not None:
+            self.dflash_ring_cpu = ring.offload(self.req_pool_idx, self.seqlen - 1)
 
     def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         token_indices = req_to_token_pool.req_to_token[
@@ -1609,6 +1615,14 @@ class Req(ReqDllmMixin):
         token_to_kv_pool_allocator.load_cpu_copy(
             self.kv_cache_cpu, token_indices, mamba_indices=self.mamba_pool_idx
         )
+        ring = self._pd_dflash_draft_ring(token_to_kv_pool_allocator)
+        if ring is not None:
+            ring.load(
+                getattr(self, "dflash_ring_cpu", None),
+                self.req_pool_idx,
+                self.seqlen - 1,
+            )
+            self.dflash_ring_cpu = None
         if envs.SGLANG_TEST_RETRACT_VERIFY.get():
             from sglang.srt.mem_cache.retraction_debug import verify_retraction_restore
 
@@ -1620,6 +1634,13 @@ class Req(ReqDllmMixin):
                 self.rid,
             )
         del self.kv_cache_cpu
+
+    @staticmethod
+    def _pd_dflash_draft_ring(token_to_kv_pool_allocator):
+        get_kvcache = getattr(token_to_kv_pool_allocator, "get_kvcache", None)
+        if get_kvcache is None:
+            return None
+        return getattr(get_kvcache(), "_pd_dflash_draft_ring", None)
 
     def build_rebootstrap_payload(self) -> dict:
         """Build the prefill ``/generate`` payload that asks the original prefill
