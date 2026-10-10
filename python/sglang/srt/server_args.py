@@ -7220,13 +7220,13 @@ class ServerArgs:
     def _resolve_hicache_dcp_compatibility(self):
         if self.dcp_size <= 1 or not self.enable_hierarchical_cache:
             return
-        if self.hicache_storage_backend is not None:
+        # Under DCP every rank writes its own interleaved MLA shard under a
+        # rank-qualified key; only the file backend's generic page path
+        # translates logical host slots to physical rows so far.
+        if self.hicache_storage_backend not in (None, "file"):
             raise NotImplementedError(
-                "--hicache-storage-backend (L3) with --dcp-size > 1 is not "
-                "supported yet: under DCP each rank holds a distinct "
-                "interleaved MLA KV shard, so the rank-0-only replicated-MLA "
-                "backup and the storage keys must become dcp_rank-aware "
-                "first. Run HiCache+DCP with L1/L2 only."
+                "--hicache-storage-backend with --dcp-size > 1 only supports "
+                f"'file'; got {self.hicache_storage_backend!r}."
             )
         full_dflash_kv = (
             self.speculative_algorithm == "DFLASH"
@@ -7258,7 +7258,7 @@ class ServerArgs:
                 "MHA host pool has no DCP index translation."
             )
         logger.info(
-            "HiCache + DCP enabled (L1/L2 only): host pool uses widened "
+            "HiCache + DCP enabled: host pool uses widened "
             "logical slot accounting with per-rank physical translation at "
             "the transfer boundary (dcp_size=%d).",
             self.dcp_size,

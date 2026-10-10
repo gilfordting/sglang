@@ -688,7 +688,11 @@ class HiCacheController:
         is_compressed_mla_model = isinstance(
             self.mem_pool_device, DeepSeekV4TokenToKVPool
         )
-        is_rank_replicated = is_mla_model or is_compressed_mla_model
+        # DCP shards MLA KV across ranks by interleaved token, so each rank
+        # must back up its own shard under a rank-qualified key.
+        is_rank_replicated = (
+            is_mla_model or is_compressed_mla_model
+        ) and not get_parallel().dcp_enabled
         # Least Common Multiple among heterogeneous tp size
         tp_lcm_size = storage_backend_extra_config.pop("tp_lcm_size", None)
         should_split_heads = False

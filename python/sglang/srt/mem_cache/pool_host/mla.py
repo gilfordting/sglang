@@ -578,12 +578,19 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
-    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
-        assert self.dcp_size == 1, (
-            "HiCache L3 storage paths are not yet DCP-aware (per-rank shards "
-            "need dcp_rank-scoped keys); --hicache-storage-backend with "
-            "--dcp-size > 1 should have been rejected at server start."
+    def _dcp_page_row(self, index) -> int:
+        """Physical first row of the widened logical page starting at index."""
+        index = int(index)
+        if self.dcp_size == 1:
+            return index
+        assert index % self.logical_page_size == 0, (
+            f"L3 page index {index} is not aligned to the widened page "
+            f"({self.logical_page_size})."
         )
+        return index // self.dcp_size
+
+    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        index = self._dcp_page_row(index)
         if self.layout == "layer_first":
             data_page = self.kv_buffer[:, index : index + self.page_size, :, :]
         elif self.layout == "page_first":
@@ -611,6 +618,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        index = self._dcp_page_row(index)
         if self.layout == "layer_first":
             self.kv_buffer[:, index : index + self.page_size, :, :] = data_page.reshape(
                 self.layer_num,
@@ -641,6 +649,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         """
         meta data for zero copy
         """
+        indices = self.dcp_kernel_indices(indices)
         assert len(indices) % self.page_size == 0
         ptr_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
