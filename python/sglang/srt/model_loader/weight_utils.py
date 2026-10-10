@@ -1025,7 +1025,10 @@ def fastsafetensors_weights_iterator(
     except Exception:
         rank = 0
 
-    device = torch.device(f"cuda:{rank}")
+    # The process-group rank is global; on a multi-node engine it exceeds the
+    # node's GPU count. The scheduler has already bound this process to its
+    # node-local GPU, so load onto that device.
+    device = torch.device("cuda", torch.cuda.current_device())
 
     weight_files_sub_lists = [
         hf_weights_files[i : i + pg.size()]
