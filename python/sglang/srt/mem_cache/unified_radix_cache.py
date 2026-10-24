@@ -71,6 +71,7 @@ from sglang.srt.observability.metrics_collector import (
     resolve_collector_class,
 )
 from sglang.srt.session.streaming_session import StreamingSession
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -833,9 +834,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if cl is not None:
                     effective_cache_len = min(effective_cache_len, cl)
 
-            # Truncate if needed
+            # Truncate if needed. The allocator frees whole pages, so start at
+            # the page after effective_cache_len: the page straddling it is
+            # freed once, by the unaligned-tail free below. Under DCP the page
+            # is page_size * dcp_size, wider than the mamba checkpoint stride.
             if effective_cache_len < len(token_ids):
-                free_start = max(effective_cache_len, req.cache_protected_len)
+                free_start = max(
+                    ceil_align(effective_cache_len, self.page_size),
+                    req.cache_protected_len,
+                )
                 self.token_to_kv_pool_allocator.free(kv_indices[free_start:])
                 token_ids = token_ids[:effective_cache_len]
                 kv_indices = kv_indices[:effective_cache_len]
@@ -850,8 +857,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             insert_params.value = values
             result = self.insert(insert_params)
 
-            # Free unaligned tail
-            self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
+            # Free unaligned tail; pages below cache_protected_len are the tree's.
+            self.token_to_kv_pool_allocator.free(
+                kv_indices[max(page_aligned_len, req.cache_protected_len) :]
+            )
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
 

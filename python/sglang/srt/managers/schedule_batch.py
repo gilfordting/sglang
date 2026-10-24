@@ -39,6 +39,7 @@ ScheduleBatch -> ForwardBatch
 import copy
 import dataclasses
 import logging
+import math
 import re
 import sys
 from array import array
@@ -2522,7 +2523,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # to force the math calculation to retrieve the correct mamba state from h.
             return i + 1
 
-        mask = req.extend_range.length >= mamba_cache_chunk_size
+        # A checkpoint must sit on a radix page boundary: cache_finished_req
+        # inserts only the page-aligned prefix, and the allocator frees whole
+        # pages. Under DCP that page is page_size * dcp_size (512 at 64 x 8),
+        # wider than mamba_cache_chunk_size, so align to both.
+        track_align = math.lcm(mamba_cache_chunk_size, self.tree_cache.page_size)
+        prefix_len = len(req.prefix_indices)
+        fla_chunk_aligned_len = (
+            req.extend_range.length // mamba_cache_chunk_size
+        ) * mamba_cache_chunk_size
+        if track_align == mamba_cache_chunk_size:
+            track_aligned_len = fla_chunk_aligned_len
+        else:
+            track_aligned_len = (
+                prefix_len + req.extend_range.length
+            ) // track_align * track_align - prefix_len
+            # The tracked state is read from h, which exists only at
+            # mamba_cache_chunk_size boundaries of this extend.
+            if track_aligned_len % mamba_cache_chunk_size != 0:
+                track_aligned_len = 0
+
+        mask = track_aligned_len >= mamba_cache_chunk_size
         track_index = req.mamba_ping_pong_track_buffer[req.mamba_next_track_idx].item()
         mamba_track_seqlen = -1
         if mask:
@@ -2537,21 +2558,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             # mamba_track_seqlen_aligned/mamba_last_track_seqlen is actual tracked seqlen. Used to pass to
             # mamba radix cache to track which seqlen this mamba state should store at.
-            mamba_track_seqlen_aligned = (
-                len(req.prefix_indices)
-                + (req.extend_range.length // mamba_cache_chunk_size)
-                * mamba_cache_chunk_size
-            )
+            mamba_track_seqlen_aligned = prefix_len + track_aligned_len
 
             # mamba_track_fla_chunk_aligned is the aligned seqlen based on mamba_cache_chunk_size
             # If mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned, which can be true when
             # page_size > mamba_cache_chunk_size, we need to force the math calculation to retrieve the correct mamba state from h
             # by _force_track_h()
-            mamba_track_fla_chunk_aligned = (
-                len(req.prefix_indices)
-                + (req.extend_range.length // mamba_cache_chunk_size)
-                * mamba_cache_chunk_size
-            )
+            mamba_track_fla_chunk_aligned = prefix_len + fla_chunk_aligned_len
             if mamba_track_fla_chunk_aligned != mamba_track_seqlen_aligned:
                 # We want to track mamba_track_seqlen_aligned, and it's not the last position,
                 # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
@@ -2571,7 +2584,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # is within the current extend batch.
                 branching_seqlen_aligned_mask = (
                     req.mamba_branching_seqlen - len(req.prefix_indices)
-                ) % mamba_cache_chunk_size == 0
+                ) % mamba_cache_chunk_size == 0 and (
+                    track_align == mamba_cache_chunk_size
+                    or req.mamba_branching_seqlen % track_align == 0
+                )
                 if (
                     req.mamba_branching_seqlen > len(req.prefix_indices)
                     and req.mamba_branching_seqlen < mamba_track_seqlen

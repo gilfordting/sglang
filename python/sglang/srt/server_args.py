@@ -5594,6 +5594,16 @@ class ServerArgs:
             assert view.mamba_track_interval >= view.speculative_num_draft_tokens
         if view.page_size is not None:
             assert view.mamba_track_interval % view.page_size == 0
+            # Under DCP the radix/allocator page is page_size * dcp_size. A
+            # colocated node caches decode checkpoints, and one between those
+            # pages gets attached to a shorter radix key, so the interval must
+            # be a multiple of the widened page.
+            if view.disaggregation_mode == "null":
+                radix_page_size = view.page_size * view.dcp_size
+                assert view.mamba_track_interval % radix_page_size == 0, (
+                    f"--mamba-track-interval {view.mamba_track_interval} must be "
+                    f"a multiple of page_size * dcp_size = {radix_page_size}"
+                )
             assert self.mamba_cache_chunk_size is not None
 
             if (
