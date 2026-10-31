@@ -438,6 +438,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dflash_use_aux_hidden_state = False
         self.dflash_target_layer_ids = None
         self.dflash_draft_num_layers = None
+        self.manual_use_aux_hidden_state = False
+        self.manual_aux_hidden_state_layer_ids = None
         if (
             (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone())
             and not self.is_draft_worker
@@ -520,6 +522,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 target_num_layers=int(target_num_layers),
                 draft_num_layers=int(draft_num_layers),
             )
+
+        if (
+            server_args.aux_hidden_state_layer_ids is not None
+            and not self.is_draft_worker
+        ):
+            if self.spec_algorithm.is_none():
+                self.manual_use_aux_hidden_state = True
+                self.manual_aux_hidden_state_layer_ids = (
+                    server_args.aux_hidden_state_layer_ids
+                )
+            else:
+                raise ValueError(
+                    "--aux-hidden-state-layer-ids is only supported when "
+                    "speculative_algorithm is disabled."
+                )
 
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
@@ -1060,6 +1077,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     "set_dflash_layers_to_capture, which is required for DFLASH."
                 )
             self.model.set_dflash_layers_to_capture(self.dflash_target_layer_ids)
+        if self.manual_use_aux_hidden_state:
+            self._set_manual_aux_hidden_capture()
+
+    def _set_manual_aux_hidden_capture(self):
+        layer_ids = self.manual_aux_hidden_state_layer_ids
+        if layer_ids is None:
+            raise ValueError(
+                "--aux-hidden-state-layer-ids is required for manual aux-hidden capture "
+                f"with model {self.model.__class__.__name__}."
+            )
+        if not hasattr(self.model, "set_dflash_layers_to_capture"):
+            raise ValueError(
+                f"Model {self.model.__class__.__name__} does not implement "
+                "set_dflash_layers_to_capture, which is required for manual "
+                "aux-hidden capture."
+            )
+        self.model.set_dflash_layers_to_capture(layer_ids)
 
     def remote_instance_init_transfer_engine(self):
         try:

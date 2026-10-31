@@ -92,6 +92,8 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
+    # Optional auxiliary hidden states (e.g., selected layer features for DFLASH).
+    aux_hidden_states: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
@@ -357,17 +359,30 @@ class LogitsProcessor(nn.Module):
             logits_metadata,
         )
 
-        hidden_states_to_store = self._get_hidden_states_to_store(
-            hidden_states,
-            hidden_states_before_norm,
-            aux_hidden_states,
-            pruned_states,
-            pruned_states_before_norm,
-            aux_pruned_states,
-            sample_indices,
-            logits_metadata,
+        hidden_states_to_store, aux_hidden_states_to_store = (
+            self._get_hidden_states_to_store(
+                hidden_states,
+                hidden_states_before_norm,
+                aux_hidden_states,
+                pruned_states,
+                pruned_states_before_norm,
+                aux_pruned_states,
+                sample_indices,
+                logits_metadata,
+            )
         )
         del hidden_states
+
+        if (
+            logits_metadata.capture_hidden_mode.need_capture()
+            and not logits_metadata.extend_return_logprob
+        ):
+            return LogitsProcessorOutput(
+                next_token_logits=None,
+                hidden_states=hidden_states_to_store,
+                aux_hidden_states=aux_hidden_states_to_store,
+                mm_input_embeds=logits_metadata.mm_input_embeds,
+            )
 
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.
@@ -380,6 +395,7 @@ class LogitsProcessor(nn.Module):
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
+                aux_hidden_states=aux_hidden_states_to_store,
                 # FIXME: These fields are not logits-related but are passed through here as a
                 # workaround since ForwardBatch is local to forward_batch_generation().
                 # They should be moved to GenerationBatchResult to keep this class clean.
@@ -421,6 +437,7 @@ class LogitsProcessor(nn.Module):
         return LogitsProcessorOutput(
             next_token_logits=sampled_logits,
             hidden_states=hidden_states_to_store,
+            aux_hidden_states=aux_hidden_states_to_store,
             input_token_logprobs=logprobs_result.input_token_logprobs,
             input_top_logprobs_val=logprobs_result.input_top_logprobs_val,
             input_top_logprobs_idx=logprobs_result.input_top_logprobs_idx,
@@ -596,39 +613,47 @@ class LogitsProcessor(nn.Module):
         aux_pruned_states: Optional[List[torch.Tensor]],
         sample_indices: Optional[torch.Tensor],
         logits_metadata: LogitsMetadata,
-    ) -> Optional[torch.Tensor]:
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         hidden_states_to_store: Optional[torch.Tensor] = None
+        aux_hidden_states_to_store: Optional[torch.Tensor] = None
         hidden_states_to_store_before_norm: Optional[torch.Tensor] = None
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
+                hidden_states_to_store = hidden_states
                 if aux_hidden_states is not None:
-                    aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
-                    hidden_states_to_store = aux_hidden_states
-                else:
-                    hidden_states_to_store = hidden_states
+                    # DFLASH: buffer-backed captures use the contiguous view, no cat.
+                    from sglang.srt.layers.communicator import (
+                        dflash_capture_joint_view,
+                    )
+
+                    joint_view = dflash_capture_joint_view(aux_hidden_states)
+                    aux_hidden_states_to_store = (
+                        joint_view
+                        if joint_view is not None
+                        else torch.cat(aux_hidden_states, dim=-1)
+                    )
                 hidden_states_to_store_before_norm = hidden_states_before_norm
             elif logits_metadata.capture_hidden_mode.is_last():
                 # Get the last token hidden states. If sample_indices is None,
                 # pruned states only contain the last tokens already.
+                hidden_states_to_store = (
+                    pruned_states[sample_indices]
+                    if sample_indices is not None
+                    else pruned_states
+                )
+                if hidden_states_before_norm is not None:
+                    hidden_states_to_store_before_norm = (
+                        pruned_states_before_norm[sample_indices]
+                        if sample_indices is not None
+                        else pruned_states_before_norm
+                    )
                 if aux_hidden_states is not None:
                     aux_pruned_states = torch.cat(aux_pruned_states, dim=-1)
-                    hidden_states_to_store = (
+                    aux_hidden_states_to_store = (
                         aux_pruned_states[sample_indices]
                         if sample_indices is not None
                         else aux_pruned_states
                     )
-                else:
-                    hidden_states_to_store = (
-                        pruned_states[sample_indices]
-                        if sample_indices is not None
-                        else pruned_states
-                    )
-                    if hidden_states_before_norm is not None:
-                        hidden_states_to_store_before_norm = (
-                            pruned_states_before_norm[sample_indices]
-                            if sample_indices is not None
-                            else pruned_states_before_norm
-                        )
             else:
                 assert False, "Should never reach"
 
@@ -637,7 +662,7 @@ class LogitsProcessor(nn.Module):
             # prefer to return it.
             hidden_states_to_store = hidden_states_to_store_before_norm
 
-        return hidden_states_to_store
+        return hidden_states_to_store, aux_hidden_states_to_store
 
     def process_input_logprobs(self, input_logits, logits_metadata: LogitsMetadata):
         input_logprobs = torch.nn.functional.log_softmax(input_logits, dim=-1)

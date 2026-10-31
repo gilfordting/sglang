@@ -2238,6 +2238,11 @@ class ServerArgs:
         bool,
         "Enable returning hidden states with responses.",
     ] = False
+    aux_hidden_state_layer_ids: A[
+        Optional[List[int]],
+        "Target layer ids whose hidden states are captured as auxiliary features "
+        "(DFLASH training capture; requires speculative_algorithm disabled).",
+    ] = None
     enable_return_routed_experts: A[
         bool,
         "Enable returning routed experts of each layer with responses.",

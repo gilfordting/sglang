@@ -1005,11 +1005,22 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                     and output.mm_input_embeds is not None
                 ):
                     mm_input_embeds = output.mm_input_embeds[: self.raw_num_tokens]
+                # DFLASH: the logits-GEMM bypass leaves next_token_logits None under
+                # FULL capture, and aux hidden states must survive reassembly.
                 return LogitsProcessorOutput(
-                    next_token_logits=output.next_token_logits[: self.raw_num_tokens],
+                    next_token_logits=(
+                        output.next_token_logits[: self.raw_num_tokens]
+                        if output.next_token_logits is not None
+                        else None
+                    ),
                     hidden_states=(
                         output.hidden_states[: self.raw_num_tokens]
                         if output.hidden_states is not None
+                        else None
+                    ),
+                    aux_hidden_states=(
+                        output.aux_hidden_states[: self.raw_num_tokens]
+                        if output.aux_hidden_states is not None
                         else None
                     ),
                     mm_input_embeds=mm_input_embeds,

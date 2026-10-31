@@ -1131,7 +1131,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
             req.mamba_next_track_idx = None
 
     def clear(self):
-        logger.info("Reset HybridReqToTokenPool")
         super().clear()
         self.mamba_allocator.clear()
         # The int8 checkpoint pool holds radix-cached states in its own slots; a

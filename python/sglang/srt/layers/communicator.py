@@ -329,6 +329,30 @@ def get_attn_tp_context():
     return ATTN_TP_CONTEXT
 
 
+# Persistent DFLASH aux-capture buffer [max_total_tokens, k * hidden], installed by
+# the dtrain producer (None in normal serving). The capture site below slice-writes
+# captured layers into it; dflash_capture_joint_view() replaces the per-request cat.
+_dflash_capture_buffer: Optional[torch.Tensor] = None
+
+
+def set_dflash_capture_buffer(buffer: Optional[torch.Tensor]) -> None:
+    global _dflash_capture_buffer
+    _dflash_capture_buffer = buffer
+
+
+def dflash_capture_joint_view(
+    aux_hidden_states: List[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Return the contiguous joint view when the entries live in the capture buffer."""
+    buffer = _dflash_capture_buffer
+    if buffer is None or not aux_hidden_states:
+        return None
+    first = aux_hidden_states[0]
+    if first.data_ptr() != buffer.data_ptr():
+        return None
+    return buffer[: first.shape[0], : len(aux_hidden_states) * first.shape[-1]]
+
+
 @dataclass
 class _LayerModeComputationContext:
     num_layers: int
@@ -507,12 +531,27 @@ class LayerCommunicator:
                 forward_batch=forward_batch,
                 context=self._context,
             )
-            if (
-                gathered_last_layer_output is residual
-                and not self._post_attn_residual_is_read_only(residual)
-            ):
-                gathered_last_layer_output = residual.clone()
-            captured_last_layer_outputs.append(gathered_last_layer_output)
+            buffer = _dflash_capture_buffer
+            if buffer is not None:
+                # DFLASH: copy into the buffer's k-th column block (no clone needed).
+                num_tokens = gathered_last_layer_output.shape[0]
+                hidden_size = gathered_last_layer_output.shape[-1]
+                start = len(captured_last_layer_outputs) * hidden_size
+                if num_tokens > buffer.shape[0] or start + hidden_size > buffer.shape[1]:
+                    raise RuntimeError(
+                        f"dflash capture buffer too small: tokens={num_tokens} "
+                        f"index={len(captured_last_layer_outputs)} hidden={hidden_size} buffer={tuple(buffer.shape)}"
+                    )
+                destination = buffer[:num_tokens, start : start + hidden_size]
+                destination.copy_(gathered_last_layer_output)
+                captured_last_layer_outputs.append(destination)
+            else:
+                if (
+                    gathered_last_layer_output is residual
+                    and not self._post_attn_residual_is_read_only(residual)
+                ):
+                    gathered_last_layer_output = residual.clone()
+                captured_last_layer_outputs.append(gathered_last_layer_output)
         return hidden_states, residual
 
     def _post_attn_residual_is_read_only(self, residual: torch.Tensor) -> bool:
